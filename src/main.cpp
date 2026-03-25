@@ -34,6 +34,7 @@ enum BootPhase { BOOT_BLE = 0, BOOT_WIFI = 1 };
 RTC_NOINIT_ATTR int   rtc_phase;
 RTC_NOINIT_ATTR int   rtc_soc;
 RTC_NOINIT_ATTR float rtc_odometer;
+RTC_NOINIT_ATTR char  rtc_vin[18];
 RTC_NOINIT_ATTR uint32_t rtc_magic;  // validates RTC data
 
 static const uint32_t RTC_MAGIC = 0xB1D0DA7A;
@@ -398,6 +399,7 @@ static void phaseBLE() {
   // Save to RTC memory and restart into WiFi phase
   rtc_soc = soc;
   rtc_odometer = odometer;
+  strncpy(rtc_vin, vin, sizeof(rtc_vin));
   rtc_magic = RTC_MAGIC;
   rtc_phase = BOOT_WIFI;
 
@@ -413,7 +415,8 @@ static void phaseWiFi() {
   // Restore data from RTC memory
   soc = rtc_soc;
   odometer = rtc_odometer;
-  Serial.printf("[4/5] Data from OBD: SOC=%d%% Odometer=%.1f km\n", soc, odometer);
+  strncpy(vin, rtc_vin, sizeof(vin));
+  Serial.printf("[4/5] Data from OBD: SOC=%d%% Odometer=%.1f km VIN=%s\n", soc, odometer, vin);
 
   // Clear RTC phase so next cold boot starts with BLE
   rtc_phase = BOOT_BLE;
@@ -461,11 +464,15 @@ static void phaseWiFi() {
 
   time_t now;
   time(&now);
+  struct tm tmNow;
+  gmtime_r(&now, &tmNow);
+  char isoTime[25];
+  strftime(isoTime, sizeof(isoTime), "%Y-%m-%dT%H:%M:%SZ", &tmNow);
 
   char json[256];
   snprintf(json, sizeof(json),
-    "{\"battery\":%d,\"odometer\":%.1f,\"timestamp\":%ld}",
-    soc, odometer, (long)now);
+    "{\"vin\":\"%s\",\"timestamp\":\"%s\",\"odometer\":%.1f,\"battery\":%d}",
+    vin, isoTime, odometer, soc);
 
   bool postSuccess = false;
   for (int attempt = 1; attempt <= MAX_POST_ATTEMPTS; attempt++) {

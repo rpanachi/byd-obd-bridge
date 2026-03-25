@@ -14,10 +14,15 @@ The car must be in **Ready mode** (ignition on, HV system active) for valid read
 ### JSON Payload
 
 ```json
-{"battery": 65, "odometer": 7703.3, "timestamp": 1774398621}
+{"vin": "LXXXXXXXXXXXXXXXXX", "timestamp": "2026-03-25T12:30:00Z", "odometer": 7703.3, "battery": 65}
 ```
 
-The timestamp is a Unix epoch obtained via NTP after WiFi connects.
+| Field | Type | Description |
+|-------|------|-------------|
+| `vin` | string | 17-character Vehicle Identification Number |
+| `timestamp` | string | ISO 8601 UTC datetime, obtained via NTP after WiFi connects |
+| `odometer` | decimal | Odometer reading in km |
+| `battery` | integer | Battery state of charge (%) |
 
 ## Readings
 
@@ -82,13 +87,13 @@ The timestamp is a Unix epoch obtained via NTP after WiFi connects.
 === iCar BLE Bridge for BYD Dolphin Mini ===
 
 [BOOT] Phase 2 — WiFi POST
-[4/5] Data from OBD: SOC=65% Odometer=7703.3 km
+[4/5] Data from OBD: SOC=65% Odometer=7703.3 km VIN=LXXXXXXXXXXXXXXXXX
 [4/5] Connecting to WiFi...
 [WiFi] IP: 192.168.1.234
 [4/5] Connected to WiFi
 [4/5] POST attempt 1/5...
 [HTTP] POST https://your-server.com/api/vehicle
-[HTTP] Payload: {"battery":65,"odometer":7703.3,"timestamp":1774398621}
+[HTTP] Payload: {"vin":"LXXXXXXXXXXXXXXXXX","timestamp":"2026-03-25T12:30:00Z","odometer":7703.3,"battery":65}
 [HTTP] Response: 200
 [4/5] Data sent successfully
 [5/5] Disconnecting from WiFi...
