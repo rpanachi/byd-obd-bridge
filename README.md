@@ -42,6 +42,17 @@ The car must be in **Ready mode** (ignition on, HV system active) for valid read
 - **iCar Pro** (Vgate) or compatible ELM327 BLE 4.0+ adapter
 - **BYD Dolphin Mini** (e-Platform 3.0, LFP Blade Battery, 38 kWh)
 
+## Project Structure
+
+```
+src/main.cpp              # Application logic (BLE, WiFi, phases)
+include/obd_parser.h      # OBD parsing, PID table, VIN decoder
+include/json_builder.h    # JSON payload and ISO 8601 formatting
+include/secrets.h         # WiFi/URL credentials (not committed)
+test/test_obd_parser/     # Tests for OBD parsing logic
+test/test_json_builder/   # Tests for JSON payload building
+```
+
 ## Setup
 
 1. Install [PlatformIO](https://platformio.org/)
@@ -55,6 +66,14 @@ The car must be in **Ready mode** (ignition on, HV system active) for valid read
    ```bash
    pio run -t upload
    ```
+
+## Tests
+
+Tests run natively on your machine (no ESP32 required):
+
+```bash
+pio test -e native
+```
 
 ## Serial Output
 
