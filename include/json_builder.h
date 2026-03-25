@@ -13,6 +13,7 @@ inline int formatISO8601(char* buf, int bufLen, time_t t) {
 
 inline int buildPayloadJSON(char* buf, int bufLen, const VehicleData& v, const char* isoTime) {
   return snprintf(buf, bufLen,
-    "{\"vin\":\"%s\",\"timestamp\":\"%s\",\"odometer\":%.1f,\"battery\":%d}",
-    v.vin, isoTime, v.odometer, (int)v.soc);
+    "{\"vin\":\"%s\",\"timestamp\":\"%s\",\"odometer\":%.1f,"
+    "\"battery_soc\":%d,\"battery_v\":%.1f,\"current_a\":%.1f}",
+    v.vin, isoTime, v.odometer, (int)v.soc, v.batteryV, v.currentA);
 }

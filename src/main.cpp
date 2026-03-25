@@ -40,6 +40,8 @@ static const uint32_t RTC_MAGIC = 0xB1D0DA7A;
 RTC_NOINIT_ATTR int      rtc_phase;
 RTC_NOINIT_ATTR int      rtc_soc;
 RTC_NOINIT_ATTR float    rtc_odometer;
+RTC_NOINIT_ATTR float    rtc_batteryV;
+RTC_NOINIT_ATTR float    rtc_currentA;
 RTC_NOINIT_ATTR char     rtc_vin[18];
 RTC_NOINIT_ATTR uint32_t rtc_magic;
 
@@ -215,6 +217,15 @@ static bool bleConnect() {
   return true;
 }
 
+// ─── READY Mode Detection ───────────────────────────────────────────────────
+
+static bool isVehicleReady() {
+  elmSetHeader("781");
+  if (!elmSend("220005") || elmHasError()) return false;
+  const char* d = findUDSData(elmResponse);
+  return d != NULL;
+}
+
 // ─── OBD Data Reading ───────────────────────────────────────────────────────
 
 static void readPIDs() {
@@ -341,25 +352,29 @@ static void phaseBLE() {
     enterDeepSleep();
   }
 
-  Serial.println("[2/5] Reading vehicle data...");
-  bool dataValid = false;
+  Serial.println("[2/5] Waiting for vehicle READY mode...");
+  bool vehicleReady = false;
   for (int attempt = 1; attempt <= OBD_READ_ATTEMPTS; attempt++) {
-    Serial.printf("[2/5] Read attempt %d/%d...\n", attempt, OBD_READ_ATTEMPTS);
-    readAllData();
-
-    if (vehicle.soc >= 0 && vehicle.odometer >= 0) {
-      dataValid = true;
-      Serial.printf("[2/5] Read successful — SOC=%d%% Odometer=%.1f km\n",
-                    (int)vehicle.soc, vehicle.odometer);
+    Serial.printf("[2/5] READY check %d/%d...\n", attempt, OBD_READ_ATTEMPTS);
+    if (isVehicleReady()) {
+      vehicleReady = true;
+      Serial.println("[2/5] Vehicle is in READY mode");
       break;
     }
-
     if (attempt < OBD_READ_ATTEMPTS) {
-      Serial.printf("[2/5] No valid data, retrying in %ds...\n", OBD_READ_DELAY_MS / 1000);
+      Serial.printf("[2/5] Not ready, retrying in %ds...\n", OBD_READ_DELAY_MS / 1000);
       delay(OBD_READ_DELAY_MS);
     }
   }
 
+  if (!vehicleReady) {
+    Serial.println("[2/5] FAILED — vehicle not in READY mode, aborting");
+    if (pClient && bleConnected) pClient->disconnect();
+    enterDeepSleep();
+  }
+
+  Serial.println("[2/5] Reading vehicle data...");
+  readAllData();
   printDashboard();
 
   Serial.println("[3/5] Disconnecting from iCar...");
@@ -367,13 +382,10 @@ static void phaseBLE() {
   delay(200);
   Serial.println("[3/5] Disconnected from iCar");
 
-  if (!dataValid) {
-    Serial.println("[3/5] FAILED — no valid car data, aborting");
-    enterDeepSleep();
-  }
-
   rtc_soc = (int)vehicle.soc;
   rtc_odometer = vehicle.odometer;
+  rtc_batteryV = vehicle.batteryV;
+  rtc_currentA = vehicle.currentA;
   strncpy(rtc_vin, vehicle.vin, sizeof(rtc_vin));
   rtc_magic = RTC_MAGIC;
   rtc_phase = BOOT_WIFI;
@@ -389,6 +401,8 @@ static void phaseBLE() {
 static void phaseWiFi() {
   vehicle.soc = rtc_soc;
   vehicle.odometer = rtc_odometer;
+  vehicle.batteryV = rtc_batteryV;
+  vehicle.currentA = rtc_currentA;
   strncpy(vehicle.vin, rtc_vin, sizeof(vehicle.vin));
   Serial.printf("[4/5] Data from OBD: SOC=%d%% Odometer=%.1f km VIN=%s\n",
                 (int)vehicle.soc, vehicle.odometer, vehicle.vin);

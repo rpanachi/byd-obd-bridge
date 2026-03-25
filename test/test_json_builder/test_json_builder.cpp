@@ -12,13 +12,15 @@ void test_buildPayloadJSON_format(void) {
   strcpy(v.vin, "LGXCE4CB1R0123456");
   v.soc = 65;
   v.odometer = 7703.3f;
+  v.batteryV = 29.8f;
+  v.currentA = 2.3f;
 
-  char json[256];
+  char json[512];
   buildPayloadJSON(json, sizeof(json), v, "2026-03-25T12:30:00Z");
 
   TEST_ASSERT_EQUAL_STRING(
     "{\"vin\":\"LGXCE4CB1R0123456\",\"timestamp\":\"2026-03-25T12:30:00Z\","
-    "\"odometer\":7703.3,\"battery\":65}",
+    "\"odometer\":7703.3,\"battery_soc\":65,\"battery_v\":29.8,\"current_a\":2.3}",
     json);
 }
 
@@ -32,7 +34,7 @@ void test_buildPayloadJSON_zero_soc(void) {
   char json[256];
   buildPayloadJSON(json, sizeof(json), v, "2026-01-01T00:00:00Z");
 
-  TEST_ASSERT_NOT_NULL(strstr(json, "\"battery\":0"));
+  TEST_ASSERT_NOT_NULL(strstr(json, "\"battery_soc\":0"));
 }
 
 void test_buildPayloadJSON_empty_vin(void) {
