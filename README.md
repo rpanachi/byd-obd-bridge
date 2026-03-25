@@ -1,18 +1,35 @@
 # iCar BLE Bridge for BYD Dolphin Mini
 
-ESP32 project that connects via Bluetooth Low Energy to an iCar (ELM327-compatible) OBD2 adapter plugged into a BYD Dolphin Mini and reads vehicle data to Serial output.
+ESP32 project that reads vehicle data from a BYD EV via an iCar (ELM327-compatible) BLE OBD2 adapter and POSTs it as JSON to a configurable URL. Could work on other BYD EV models, but has only been tested on a **BYD Dolphin Mini**.
+
+## How It Works
+
+The ESP32 runs a one-shot operation in two phases (BLE and WiFi can't share the radio reliably on ESP32):
+
+1. **Phase 1 — BLE Read**: Connect to iCar adapter, read OBD2 data, save to RTC memory, restart
+2. **Phase 2 — WiFi POST**: Connect to WiFi, POST JSON payload, enter deep sleep
+
+The car must be in **Ready mode** (ignition on, HV system active) for valid readings. If the odometer can't be read (car is off), the ESP32 skips the POST and goes directly to deep sleep.
+
+### JSON Payload
+
+```json
+{"battery": 65, "odometer": 7703.3, "timestamp": 1774398621}
+```
+
+The timestamp is a Unix epoch obtained via NTP after WiFi connects.
 
 ## Readings
 
 | Parameter | ECU | PID | Format | Status |
 |-----------|-----|-----|--------|--------|
-| Battery SOC (%) | `781` | `0005` | 1 byte, direct % | **Confirmed** (78% matched dashboard) |
-| Odometer (km) | `743` | `0026` | 3 bytes LE, /10 | **Confirmed** (7690.0 km matched dashboard) |
-| VIN | `7DF` | `09 02` | Multi-frame, 17 ASCII chars | **Confirmed** (LXXXXXXXXXXXXXXXXX) |
-| Battery Voltage | `781` | `0008` | 2 bytes LE | From Car Scanner log |
-| Battery Current (A) | `781` | `0009` | 2 bytes LE, (val-5000)/10 | From Car Scanner log |
+| Battery SOC (%) | `781` | `0005` | 1 byte, direct % | **Confirmed** |
+| Odometer (km) | `743` | `0026` | 3 bytes LE, /10 | **Confirmed** |
+| VIN | `7DF` | `09 02` | Multi-frame, 17 ASCII chars | **Confirmed** |
+| Battery Voltage | `781` | `0008` | 2 bytes LE, /10 | **Confirmed** |
+| Battery Current (A) | `781` | `0009` | 2 bytes LE, (val-5000)/10 | **Confirmed** |
 | Battery Capacity (Ah) | `743` | `0104` | 2 bytes LE, /100 | **Confirmed** (50.00 Ah) |
-| 12V Battery (V) | — | `AT RV` | ELM327 internal | From Car Scanner log (13.7V) |
+| 12V Battery (V) | — | `AT RV` | ELM327 internal | **Confirmed** |
 
 ## Hardware
 
@@ -20,36 +37,77 @@ ESP32 project that connects via Bluetooth Low Energy to an iCar (ELM327-compatib
 - **iCar Pro** (Vgate) or compatible ELM327 BLE 4.0+ adapter
 - **BYD Dolphin Mini** (e-Platform 3.0, LFP Blade Battery, 38 kWh)
 
-## Build & Upload
+## Setup
 
-Requires [PlatformIO](https://platformio.org/).
-
-```bash
-pio run              # Build
-pio run -t upload    # Upload to ESP32
-pio device monitor   # Monitor serial output (115200 baud)
-```
+1. Install [PlatformIO](https://platformio.org/)
+2. Copy `include/secrets.h.example` to `include/secrets.h` and fill in your values:
+   ```c
+   #define WIFI_SSID "your-wifi-ssid"
+   #define WIFI_PASS "your-wifi-password"
+   #define POST_URL  "https://your-server.com/api/vehicle"
+   ```
+3. Build and upload:
+   ```bash
+   pio run -t upload
+   ```
 
 ## Serial Output
 
 ```
+=== iCar BLE Bridge for BYD Dolphin Mini ===
+
+[BOOT] Phase 1 — BLE Read
+[1/5] Connecting to iCar adapter...
+[1/5] Connected to iCar Pro
+[2/5] Reading vehicle data...
+[2/5] Read attempt 1/5...
+[2/5] Read successful — SOC=65% Odometer=7703.3 km
+
 ========================================
    BYD Dolphin Mini - Vehicle Data
 ========================================
   VIN:              LXXXXXXXXXXXXXXXXX
-  Battery SOC:      78%
-  Odometer:         7690.0 km
-  Battery Voltage:  29.8 V
-  Battery Current:  2.3 A
+  Battery SOC:      65%
+  Odometer:         7703.3 km
+  Battery Voltage:  29.9 V
+  Battery Current:  0.8 A
   Battery Capacity: 50.00 Ah
   12V Battery:      13.7 V
-  Car State:        READY
 ========================================
+
+[3/5] Disconnecting from iCar...
+[3/5] Disconnected from iCar
+[3/5] Restarting for WiFi phase...
+
+=== iCar BLE Bridge for BYD Dolphin Mini ===
+
+[BOOT] Phase 2 — WiFi POST
+[4/5] Data from OBD: SOC=65% Odometer=7703.3 km
+[4/5] Connecting to WiFi...
+[WiFi] IP: 192.168.1.234
+[4/5] Connected to WiFi
+[4/5] POST attempt 1/5...
+[HTTP] POST https://your-server.com/api/vehicle
+[HTTP] Payload: {"battery":65,"odometer":7703.3,"timestamp":1774398621}
+[HTTP] Response: 200
+[4/5] Data sent successfully
+[5/5] Disconnecting from WiFi...
+[5/5] Disconnected from WiFi
+[SLEEP] Entering deep sleep...
 ```
 
-## BLE Compatibility
+## Retry & Error Handling
 
-The firmware auto-detects two common BLE profiles:
+| Step | Retries | Timeout | On failure |
+|------|---------|---------|------------|
+| BLE connection | 3 | 15s scan | Deep sleep |
+| OBD read | 5 | 10s between retries | Deep sleep |
+| WiFi connection | 3 | 30s each | Deep sleep |
+| HTTP POST | 5 | 3s between retries | Deep sleep |
+
+If the car is off (odometer not readable), the ESP32 skips WiFi/POST and goes directly to deep sleep.
+
+## BLE Compatibility
 
 | Profile | Service UUID | TX (write) | RX (notify) |
 |---------|-------------|------------|-------------|
@@ -60,7 +118,6 @@ The firmware auto-detects two common BLE profiles:
 
 - **CAN bus:** 500 kbps, 11-bit identifiers (ELM327 protocol 6)
 - **Diagnostic protocol:** UDS (ISO 14229) service 0x22 (ReadDataByIdentifier)
-- **Init sequence:** `ATZ ATE0 ATH1 ATSP0 ATS0 ATM0 ATAT1` (matches Car Scanner app)
 
 ### ECU Map
 
@@ -75,7 +132,7 @@ The firmware auto-detects two common BLE profiles:
 
 ### Data Encoding
 
-All multi-byte values use **little-endian** byte order (same byte position as in CAN frame, no spaces when `ATS0`):
+All multi-byte values use **little-endian** byte order (no spaces with `ATS0`):
 
 | PID | Bytes | Formula | Example |
 |-----|-------|---------|---------|
@@ -92,10 +149,4 @@ All multi-byte values use **little-endian** byte order (same byte position as in
 - The BYD Dolphin Mini does **not** use header `7E7` for BMS (unlike the standard Dolphin/Atto 3). The BMS is at header `781`.
 - Standard OBD2 service 0x01 PIDs are not supported by this vehicle (returns `7F 01 22`).
 - PID `001F` on ECU 743/7E0 is a running counter, **not** SOC.
-
-## SOC Investigation History
-
-Finding the SOC PID required extensive reverse-engineering:
-- 5 phases of ECU scanning across headers 600-7FF
-- CAN broadcast monitoring (ID 644 — cell voltages)
-- Final breakthrough via Car Scanner app log analysis revealing ECU `781` (BMS) in the 780-78F range which was initially missed during manual scanning
+- ESP32 BLE and WiFi can't reliably share the radio in the same boot cycle. The two-phase restart approach solves this.

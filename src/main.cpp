@@ -1,39 +1,42 @@
 /**
  * BYD Dolphin Mini — iCar BLE OBD2 Bridge
  *
- * Reads vehicle data via BLE from an iCar/Vgate ELM327 OBD2 adapter
- * and outputs to Serial every 5 seconds.
+ * Two-phase operation (BLE and WiFi can't share the radio reliably):
+ *   Phase 1 (BOOT_BLE): Connect BLE, read OBD data, save to RTC memory, restart
+ *   Phase 2 (BOOT_WIFI): Connect WiFi, POST JSON, deep sleep
  *
- * Data sources confirmed via Car Scanner app log analysis:
- *
- *   ECU 781 (BMS — response on 789):
- *     PID 0005: Battery SOC (%) — 1 byte, direct percentage
- *     PID 0008: Battery Voltage  — 2 bytes LE
- *     PID 0009: Battery Current  — 2 bytes LE, (val-5000)/10 = A
- *     PID 1FFD: Pack data        — 4 bytes (details TBD)
- *     PID 000A: Unknown          — 2 bytes LE
- *     PID 000E: Unknown          — 2 bytes LE
- *     PID 000B: Unknown          — 2 bytes LE (91 observed)
- *     PID 0004: Unknown          — 2 bytes LE (62 observed)
- *     PID 000F: Unknown          — 3 bytes LE
- *     PID 0010: Unknown          — 3 bytes LE
- *
- *   ECU 743 (VCU — response on 74B, mirror of 7E0/7E8):
- *     PID 0026: Odometer         — 3 bytes LE, /10 = km
- *     PID 0104: Battery capacity — 2 bytes LE, /100 = Ah (50.00 observed)
- *     PID 0105: Battery capacity — same as 0104
- *     PID 001F: Uptime counter   — NOT SOC (increments over time)
- *
- *   Broadcast 7DF:
- *     Service 09 PID 02: VIN (17 chars, multi-frame)
- *     AT RV: 12V battery voltage
- *
- * Protocol: CAN 500kbps 11-bit (ELM327 protocol 6)
- * Tested with: Vgate iCar Pro BLE 4.0 (service UUID 18F0)
+ * Data sources (CAN 500kbps 11-bit, ELM327 protocol 6):
+ *   ECU 781 (BMS):  SOC (PID 0005), Voltage (0008), Current (0009)
+ *   ECU 743 (VCU):  Odometer (PID 0026), Capacity (0104)
+ *   Broadcast 7DF:  VIN (service 09 PID 02), 12V battery (AT RV)
  */
 
 #include <Arduino.h>
 #include <BLEDevice.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include "secrets.h"
+
+// ─── Constants ──────────────────────────────────────────────────────────────
+
+static const int MAX_READ_ATTEMPTS = 5;
+static const int READ_RETRY_DELAY_MS = 10000;
+static const int MAX_POST_ATTEMPTS = 5;
+static const int POST_RETRY_DELAY_MS = 3000;
+static const int WIFI_TIMEOUT_MS = 30000;
+static const int MAX_WIFI_ATTEMPTS = 3;
+static const int MAX_RESPONSE_LEN = 1024;
+
+// ─── RTC Memory (survives restart, lost on deep sleep) ──────────────────────
+
+enum BootPhase { BOOT_BLE = 0, BOOT_WIFI = 1 };
+
+RTC_NOINIT_ATTR int   rtc_phase;
+RTC_NOINIT_ATTR int   rtc_soc;
+RTC_NOINIT_ATTR float rtc_odometer;
+RTC_NOINIT_ATTR uint32_t rtc_magic;  // validates RTC data
+
+static const uint32_t RTC_MAGIC = 0xB1D0DA7A;
 
 // ─── BLE Profiles ───────────────────────────────────────────────────────────
 
@@ -58,9 +61,6 @@ static const int PROFILE_COUNT = sizeof(PROFILES) / sizeof(PROFILES[0]);
 
 // ─── Globals ────────────────────────────────────────────────────────────────
 
-static const int MAX_RESPONSE_LEN = 1024;
-static const uint32_t POLL_INTERVAL_MS = 5000;
-
 static BLERemoteCharacteristic* pTxChar = nullptr;
 static BLERemoteCharacteristic* pRxChar = nullptr;
 static BLEClient* pClient = nullptr;
@@ -72,17 +72,24 @@ static volatile int responseLen = 0;
 static volatile bool responseReady = false;
 static bool deviceFound = false;
 static bool connected = false;
-static bool elmReady = false;
 
 // Vehicle data
 static char  vin[18]    = {0};
-static int   soc        = -1;    // % (from ECU 781)
-static float odometer   = -1;    // km (from ECU 743)
-static float batteryV   = -1;    // V (from ECU 781, PID 0008)
-static float currentA   = -1;    // A (from ECU 781, PID 0009)
-static float auxBattV   = -1;    // V (from ELM327 AT RV)
-static float capacity   = -1;    // Ah (from ECU 743, PID 0104)
-static bool  carAwake   = false;
+static int   soc        = -1;
+static float odometer   = -1;
+static float batteryV   = -1;
+static float currentA   = -1;
+static float auxBattV   = -1;
+static float capacity   = -1;
+
+// ─── Deep Sleep ─────────────────────────────────────────────────────────────
+
+static void enterDeepSleep() {
+  Serial.println("[SLEEP] Entering deep sleep...");
+  Serial.flush();
+  delay(100);
+  esp_deep_sleep_start();
+}
 
 // ─── BLE Callbacks ──────────────────────────────────────────────────────────
 
@@ -124,11 +131,7 @@ class ScanCallbacks : public BLEAdvertisedDeviceCallbacks {
 
 class ClientCallbacks : public BLEClientCallbacks {
   void onConnect(BLEClient*) override { connected = true; }
-  void onDisconnect(BLEClient*) override {
-    connected = false;
-    elmReady = false;
-    Serial.println("[BLE] Disconnected");
-  }
+  void onDisconnect(BLEClient*) override { connected = false; }
 };
 
 // ─── ELM327 Communication ──────────────────────────────────────────────────
@@ -155,31 +158,24 @@ static int parseHexByte(const char* p) {
   return (int)strtol(hex, NULL, 16);
 }
 
-// Find data bytes after "62PPPP" in a UDS positive response (ATS0 = no spaces)
-// Response format: "78904620005XX" or "789046200054E"
-// We find "62", skip the 2-byte PID echo (4 hex chars), then data starts.
 static const char* findDataStart(const char* resp) {
   const char* p = strstr(resp, "62");
   if (!p) return NULL;
-  p += 6;  // skip "62PPPP" (service byte "62" + 4 hex PID chars, no spaces)
+  p += 6;
   return isxdigit(*p) ? p : NULL;
 }
 
-// Parse a 2-byte little-endian value from compact hex (no spaces)
-// e.g. "2A01" -> b0=0x2A, b1=0x01 -> LE = 0x012A = 298
-static int parseLE16(const char* dataStart) {
-  int b0 = parseHexByte(dataStart);
-  int b1 = parseHexByte(dataStart + 2);
+static int parseLE16(const char* d) {
+  int b0 = parseHexByte(d);
+  int b1 = parseHexByte(d + 2);
   if (b0 < 0 || b1 < 0) return -1;
   return b0 | (b1 << 8);
 }
 
-// Parse a 3-byte little-endian value from compact hex
-// e.g. "642C01" -> 0x012C64 = 76900
-static int parseLE24(const char* dataStart) {
-  int b0 = parseHexByte(dataStart);
-  int b1 = parseHexByte(dataStart + 2);
-  int b2 = parseHexByte(dataStart + 4);
+static int parseLE24(const char* d) {
+  int b0 = parseHexByte(d);
+  int b1 = parseHexByte(d + 2);
+  int b2 = parseHexByte(d + 4);
   if (b0 < 0 || b1 < 0 || b2 < 0) return -1;
   return b0 | (b1 << 8) | (b2 << 16);
 }
@@ -224,7 +220,6 @@ static bool bleConnect() {
   if (!pRxChar || !pTxChar) return false;
   if (pRxChar->canNotify()) pRxChar->registerForNotify(notifyCallback);
 
-  Serial.printf("[BLE] Connected via %s\n", pActiveProfile->name);
   return true;
 }
 
@@ -237,7 +232,6 @@ static bool initElm() {
     if (!sendCmd(c, (strcmp(c, "ATZ") == 0) ? 5000 : 3000)) return false;
     delay(100);
   }
-  Serial.println("[ELM] Ready");
   return true;
 }
 
@@ -254,29 +248,18 @@ static void readVIN() {
   if (!sendCmd("0902", 5000) || hasError()) return;
 
   memset(vin, 0, sizeof(vin));
-  // Response (ATS0, ATH1): 7E810144902014C47587E82143453443433053 7E82230303437323130
-  // CAN ID "7E8" is 3 hex chars (odd), so byte pairs misalign across frames.
-  // Parse frame by frame: find "7E8", extract data bytes after it.
-  //   Frame 1: 7E8 [10 14] [49 02 01] [4C 47 58]     (first frame + svc header + 3 VIN bytes)
-  //   Frame 2: 7E8 [21] [43 45 34 43 43 30 53]        (continuation + 7 VIN bytes)
-  //   Frame 3: 7E8 [22] [30 30 34 37 32 31 30]        (continuation + 7 VIN bytes)
   int vinIdx = 0;
   const char* p = responseBuf;
   int frameNum = 0;
 
   while (*p && vinIdx < 17) {
-    // Find next "7E8" frame header
     const char* frame = strstr(p, "7E8");
     if (!frame) break;
-    const char* data = frame + 3;  // skip "7E8" (3 hex chars)
-
-    // Find end of this frame (next "7E8" or end of string)
+    const char* data = frame + 3;
     const char* nextFrame = strstr(data, "7E8");
     int frameLen = nextFrame ? (nextFrame - data) : strlen(data);
 
     if (frameNum == 0) {
-      // First frame: skip "1014490201" (FF header + length + service response)
-      // = 10 chars: "10" + "14" + "490201"
       if (frameLen >= 10) {
         const char* vinData = data + 10;
         while (vinData < data + frameLen && vinIdx < 17) {
@@ -286,7 +269,6 @@ static void readVIN() {
         }
       }
     } else {
-      // Continuation frame: skip "2X" (2 hex chars for seq number)
       if (frameLen >= 2) {
         const char* vinData = data + 2;
         while (vinData < data + frameLen && vinIdx < 17) {
@@ -296,86 +278,55 @@ static void readVIN() {
         }
       }
     }
-
     frameNum++;
-    p = data;  // advance past this frame header
+    p = data;
   }
 }
 
-// ─── Data Reading ───────────────────────────────────────────────────────────
+// ─── OBD Data Reading ───────────────────────────────────────────────────────
 
-static void readBMSData() {
-  // ECU 781 — BMS (response on 789)
+static void readAllData() {
   setHeader("781");
 
-  // SOC (PID 0005) — 1 byte, direct percentage
   if (sendCmd("220005") && !hasError()) {
     const char* d = findDataStart(responseBuf);
-    if (d) {
-      int val = parseHexByte(d);
-      if (val >= 0) {
-        soc = val;
-        carAwake = true;
-      }
-    }
+    if (d) { int val = parseHexByte(d); if (val >= 0) soc = val; }
   }
   delay(60);
 
-  if (!carAwake) return;
-
-  // Voltage (PID 0008) — 2 bytes LE
   if (sendCmd("220008") && !hasError()) {
     const char* d = findDataStart(responseBuf);
-    if (d) {
-      int raw = parseLE16(d);
-      if (raw >= 0) batteryV = raw / 10.0f;
-    }
+    if (d) { int raw = parseLE16(d); if (raw >= 0) batteryV = raw / 10.0f; }
   }
   delay(60);
 
-  // Current (PID 0009) — 2 bytes LE, (val-5000)/10 = A
   if (sendCmd("220009") && !hasError()) {
     const char* d = findDataStart(responseBuf);
-    if (d) {
-      int raw = parseLE16(d);
-      if (raw >= 0) currentA = (raw - 5000) / 10.0f;
-    }
+    if (d) { int raw = parseLE16(d); if (raw >= 0) currentA = (raw - 5000) / 10.0f; }
   }
   delay(60);
-}
 
-static void readVCUData() {
-  // ECU 743 — VCU (response on 74B, mirror of 7E0/7E8)
   setHeader("743");
 
-  // Odometer (PID 0026) — 3 bytes LE, /10 = km
   if (sendCmd("220026") && !hasError()) {
     const char* d = findDataStart(responseBuf);
-    if (d) {
-      int raw = parseLE24(d);
-      if (raw >= 0) odometer = raw / 10.0f;
-    }
+    if (d) { int raw = parseLE24(d); if (raw >= 0) odometer = raw / 10.0f; }
   }
   delay(60);
 
-  // Capacity (PID 0104) — 2 bytes LE, /100 = Ah
-  if (carAwake && sendCmd("220104") && !hasError()) {
+  if (sendCmd("220104") && !hasError()) {
     const char* d = findDataStart(responseBuf);
-    if (d) {
-      int raw = parseLE16(d);
-      if (raw > 0) capacity = raw / 100.0f;
-    }
+    if (d) { int raw = parseLE16(d); if (raw > 0) capacity = raw / 100.0f; }
   }
   delay(60);
-}
 
-static void read12VBattery() {
-  // 12V battery via ELM327 internal voltage reading
   sendCmd("ATSH7DF"); delay(30);
   if (sendCmd("ATRV")) {
     float v = atof(responseBuf);
     if (v > 0) auxBattV = v;
   }
+
+  if (!vin[0]) readVIN();
 }
 
 // ─── Display ────────────────────────────────────────────────────────────────
@@ -384,18 +335,166 @@ static void printDashboard() {
   Serial.println("\n========================================");
   Serial.println("   BYD Dolphin Mini - Vehicle Data");
   Serial.println("========================================");
-
-  if (vin[0])       Serial.printf("  VIN:              %s\n", vin);
-  if (soc >= 0)     Serial.printf("  Battery SOC:      %d%%\n", soc);
+  if (vin[0])        Serial.printf("  VIN:              %s\n", vin);
+  if (soc >= 0)      Serial.printf("  Battery SOC:      %d%%\n", soc);
   if (odometer >= 0) Serial.printf("  Odometer:         %.1f km\n", odometer);
   if (batteryV >= 0) Serial.printf("  Battery Voltage:  %.1f V\n", batteryV);
   if (currentA > -499) Serial.printf("  Battery Current:  %.1f A\n", currentA);
   if (capacity >= 0) Serial.printf("  Battery Capacity: %.2f Ah\n", capacity);
   if (auxBattV >= 0) Serial.printf("  12V Battery:      %.1f V\n", auxBattV);
-
-  Serial.printf("  Car State:        %s\n", carAwake ? "READY" : "sleeping");
-
   Serial.println("========================================\n");
+}
+
+// ─── Phase 1: BLE Read ─────────────────────────────────────────────────────
+
+static void phaseBLE() {
+  Serial.println("[1/5] Connecting to iCar adapter...");
+  BLEDevice::init("BYD-Bridge");
+  for (int i = 0; i < 3; i++) {
+    if (bleConnect()) break;
+    Serial.printf("[1/5] Retry %d...\n", i + 1);
+    delay(3000);
+  }
+  if (!connected) {
+    Serial.println("[1/5] FAILED — iCar not found, aborting");
+    enterDeepSleep();
+  }
+  Serial.println("[1/5] Connected to iCar Pro");
+  if (!initElm()) {
+    Serial.println("[1/5] FAILED — ELM327 init error, aborting");
+    enterDeepSleep();
+  }
+
+  Serial.println("[2/5] Reading vehicle data...");
+  bool dataValid = false;
+  for (int attempt = 1; attempt <= MAX_READ_ATTEMPTS; attempt++) {
+    Serial.printf("[2/5] Read attempt %d/%d...\n", attempt, MAX_READ_ATTEMPTS);
+    readAllData();
+
+    if (soc >= 0 && odometer >= 0) {
+      dataValid = true;
+      Serial.printf("[2/5] Read successful — SOC=%d%% Odometer=%.1f km\n", soc, odometer);
+      break;
+    }
+
+    if (attempt < MAX_READ_ATTEMPTS) {
+      Serial.printf("[2/5] No valid data, retrying in %ds...\n", READ_RETRY_DELAY_MS / 1000);
+      delay(READ_RETRY_DELAY_MS);
+    }
+  }
+
+  printDashboard();
+
+  Serial.println("[3/5] Disconnecting from iCar...");
+  if (pClient && connected) pClient->disconnect();
+  delay(200);
+  Serial.println("[3/5] Disconnected from iCar");
+
+  if (!dataValid) {
+    Serial.println("[3/5] FAILED — no valid car data, aborting");
+    enterDeepSleep();
+  }
+
+  // Save to RTC memory and restart into WiFi phase
+  rtc_soc = soc;
+  rtc_odometer = odometer;
+  rtc_magic = RTC_MAGIC;
+  rtc_phase = BOOT_WIFI;
+
+  Serial.println("[3/5] Restarting for WiFi phase...");
+  Serial.flush();
+  delay(100);
+  ESP.restart();
+}
+
+// ─── Phase 2: WiFi POST ────────────────────────────────────────────────────
+
+static void phaseWiFi() {
+  // Restore data from RTC memory
+  soc = rtc_soc;
+  odometer = rtc_odometer;
+  Serial.printf("[4/5] Data from OBD: SOC=%d%% Odometer=%.1f km\n", soc, odometer);
+
+  // Clear RTC phase so next cold boot starts with BLE
+  rtc_phase = BOOT_BLE;
+
+  Serial.println("[4/5] Connecting to WiFi...");
+  WiFi.mode(WIFI_STA);
+
+  bool wifiConnected = false;
+  for (int attempt = 1; attempt <= MAX_WIFI_ATTEMPTS; attempt++) {
+    Serial.printf("[WiFi] Attempt %d/%d...\n", attempt, MAX_WIFI_ATTEMPTS);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - start) < WIFI_TIMEOUT_MS) {
+      delay(500);
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiConnected = true;
+      break;
+    }
+
+    WiFi.disconnect(true);
+    delay(1000);
+  }
+
+  if (!wifiConnected) {
+    Serial.println("[4/5] FAILED — WiFi connection error, aborting");
+    enterDeepSleep();
+  }
+
+  Serial.printf("[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
+  Serial.println("[4/5] Connected to WiFi");
+
+  // Sync time via NTP
+  configTime(0, 0, "pool.ntp.org");
+  struct tm timeinfo;
+  getLocalTime(&timeinfo, 5000);
+
+  // POST
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.begin(POST_URL);
+  http.addHeader("Content-Type", "application/json");
+
+  time_t now;
+  time(&now);
+
+  char json[256];
+  snprintf(json, sizeof(json),
+    "{\"battery\":%d,\"odometer\":%.1f,\"timestamp\":%ld}",
+    soc, odometer, (long)now);
+
+  bool postSuccess = false;
+  for (int attempt = 1; attempt <= MAX_POST_ATTEMPTS; attempt++) {
+    Serial.printf("[4/5] POST attempt %d/%d...\n", attempt, MAX_POST_ATTEMPTS);
+    Serial.printf("[HTTP] POST %s\n", POST_URL);
+    Serial.printf("[HTTP] Payload: %s\n", json);
+
+    int httpCode = http.POST(json);
+    Serial.printf("[HTTP] Response: %d\n", httpCode);
+
+    if (httpCode >= 200 && httpCode < 500) {
+      postSuccess = true;
+      Serial.println("[4/5] Data sent successfully");
+      break;
+    }
+    if (attempt < MAX_POST_ATTEMPTS) delay(POST_RETRY_DELAY_MS);
+  }
+
+  http.end();
+
+  if (!postSuccess) {
+    Serial.println("[4/5] FAILED — POST error after all attempts");
+  }
+
+  Serial.println("[5/5] Disconnecting from WiFi...");
+  WiFi.disconnect(true);
+  Serial.println("[5/5] Disconnected from WiFi");
+
+  enterDeepSleep();
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
@@ -404,39 +503,16 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n=== iCar BLE Bridge for BYD Dolphin Mini ===\n");
-  BLEDevice::init("BYD-Bridge");
 
-  for (int i = 0; i < 3; i++) {
-    if (bleConnect()) break;
-    Serial.printf("[BLE] Retry %d...\n", i + 1);
-    delay(3000);
+  if (rtc_magic == RTC_MAGIC && rtc_phase == BOOT_WIFI) {
+    Serial.println("[BOOT] Phase 2 — WiFi POST");
+    phaseWiFi();
+  } else {
+    Serial.println("[BOOT] Phase 1 — BLE Read");
+    phaseBLE();
   }
-  if (!connected) return;
-  delay(500);
-  if (!initElm()) return;
-  elmReady = true;
-
-  readVIN();
-  readBMSData();
-  readVCUData();
-  read12VBattery();
-  printDashboard();
 }
 
 void loop() {
-  if (!elmReady || !connected) {
-    Serial.println("[!] Reconnecting...");
-    delay(3000);
-    if (bleConnect() && initElm()) {
-      elmReady = true;
-      readVIN();
-    }
-    return;
-  }
-
-  delay(POLL_INTERVAL_MS);
-  readBMSData();
-  readVCUData();
-  read12VBattery();
-  printDashboard();
+  // Never reached — both phases end with deep sleep or restart
 }

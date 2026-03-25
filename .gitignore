@@ -1,6 +1,7 @@
 .pio
 .vscode
 .claude
+include/secrets.h
 *.swp
 *.swo
 *~
