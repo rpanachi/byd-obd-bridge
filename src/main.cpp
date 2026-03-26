@@ -352,35 +352,43 @@ static void phaseBLE() {
     enterDeepSleep();
   }
 
-  Serial.println("[2/5] Waiting for vehicle READY mode...");
-  bool vehicleReady = false;
+  Serial.println("[2/5] Waiting for vehicle READY mode and reading data...");
+  bool dataValid = false;
   for (int attempt = 1; attempt <= OBD_READ_ATTEMPTS; attempt++) {
-    Serial.printf("[2/5] READY check %d/%d...\n", attempt, OBD_READ_ATTEMPTS);
-    if (isVehicleReady()) {
-      vehicleReady = true;
-      Serial.println("[2/5] Vehicle is in READY mode");
+    Serial.printf("[2/5] Attempt %d/%d...\n", attempt, OBD_READ_ATTEMPTS);
+
+    if (!isVehicleReady()) {
+      Serial.printf("[2/5] Vehicle not in READY mode, retrying in %ds...\n", OBD_READ_DELAY_MS / 1000);
+      delay(OBD_READ_DELAY_MS);
+      continue;
+    }
+    Serial.println("[2/5] Vehicle is in READY mode, reading data...");
+
+    vehicleDataInit(vehicle);
+    readAllData();
+
+    if (vehicle.soc >= 0 && vehicle.odometer >= 0 && vehicle.batteryV >= 0) {
+      dataValid = true;
+      Serial.printf("[2/5] Read OK — SOC=%d%% Odometer=%.1f km\n",
+                    (int)vehicle.soc, vehicle.odometer);
       break;
     }
-    if (attempt < OBD_READ_ATTEMPTS) {
-      Serial.printf("[2/5] Not ready, retrying in %ds...\n", OBD_READ_DELAY_MS / 1000);
-      delay(OBD_READ_DELAY_MS);
-    }
+
+    Serial.printf("[2/5] Incomplete data, retrying in %ds...\n", OBD_READ_DELAY_MS / 1000);
+    if (attempt < OBD_READ_ATTEMPTS) delay(OBD_READ_DELAY_MS);
   }
 
-  if (!vehicleReady) {
-    Serial.println("[2/5] FAILED — vehicle not in READY mode, aborting");
-    if (pClient && bleConnected) pClient->disconnect();
-    enterDeepSleep();
-  }
-
-  Serial.println("[2/5] Reading vehicle data...");
-  readAllData();
   printDashboard();
 
   Serial.println("[3/5] Disconnecting from iCar...");
   if (pClient && bleConnected) pClient->disconnect();
   delay(200);
   Serial.println("[3/5] Disconnected from iCar");
+
+  if (!dataValid) {
+    Serial.println("[3/5] FAILED — no valid data, aborting");
+    enterDeepSleep();
+  }
 
   rtc_soc = (int)vehicle.soc;
   rtc_odometer = vehicle.odometer;
