@@ -1,0 +1,19 @@
+#pragma once
+
+#include <cstdio>
+#include <ctime>
+#include "json_builder.h"
+
+// ─── HTTP Response Validation ───────────────────────────────────────────────
+
+inline bool isHTTPSuccess(int code) {
+  return code >= 200 && code < 500;
+}
+
+// ─── Payload Preparation ────────────────────────────────────────────────────
+
+inline int preparePayload(char* json, int jsonLen, const VehicleData& v, time_t now) {
+  char isoTime[25];
+  formatISO8601(isoTime, sizeof(isoTime), now);
+  return buildPayloadJSON(json, jsonLen, v, isoTime);
+}

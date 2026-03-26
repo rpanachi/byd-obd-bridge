@@ -17,7 +17,7 @@
 #include <HTTPClient.h>
 #include "secrets.h"
 #include "obd_parser.h"
-#include "json_builder.h"
+#include "http_post.h"
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
@@ -304,11 +304,8 @@ static bool postVehicleData() {
 
   time_t now;
   time(&now);
-  char isoTime[25];
-  formatISO8601(isoTime, sizeof(isoTime), now);
-
-  char json[256];
-  buildPayloadJSON(json, sizeof(json), vehicle, isoTime);
+  char json[512];
+  preparePayload(json, sizeof(json), vehicle, now);
 
   HTTPClient http;
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
@@ -321,7 +318,7 @@ static bool postVehicleData() {
     Serial.printf("[HTTP] Payload: %s\n", json);
     int code = http.POST(json);
     Serial.printf("[HTTP] Response: %d\n", code);
-    if (code >= 200 && code < 500) {
+    if (isHTTPSuccess(code)) {
       success = true;
       break;
     }
