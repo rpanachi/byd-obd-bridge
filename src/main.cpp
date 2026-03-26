@@ -21,8 +21,8 @@
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
-static const int BLE_CONNECT_ATTEMPTS     = 3;
-static const int BLE_CONNECT_DELAY_MS     = 3000;
+static const int BLE_CONNECT_ATTEMPTS     = 5;
+static const int BLE_CONNECT_DELAY_MS     = 5000;
 static const int OBD_READ_ATTEMPTS        = 5;
 static const int OBD_READ_DELAY_MS        = 10000;
 static const int WIFI_CONNECT_ATTEMPTS    = 3;
