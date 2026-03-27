@@ -96,6 +96,28 @@ void test_preparePayload_buffer_too_small(void) {
   TEST_ASSERT_GREATER_THAN(10, written);
 }
 
+// ─── isTimeValid ────────────────────────────────────────────────────────────
+
+void test_isTimeValid_epoch_zero(void) {
+  TEST_ASSERT_FALSE(isTimeValid(0));
+}
+
+void test_isTimeValid_epoch_15s(void) {
+  TEST_ASSERT_FALSE(isTimeValid(15));
+}
+
+void test_isTimeValid_2024(void) {
+  TEST_ASSERT_FALSE(isTimeValid(1704067200)); // 2024-01-01
+}
+
+void test_isTimeValid_2025(void) {
+  TEST_ASSERT_TRUE(isTimeValid(1735689600)); // 2025-01-01
+}
+
+void test_isTimeValid_2026(void) {
+  TEST_ASSERT_TRUE(isTimeValid(1767225600)); // 2026-01-01
+}
+
 // ─── Runner ─────────────────────────────────────────────────────────────────
 
 int main(int argc, char **argv) {
@@ -110,6 +132,11 @@ int main(int argc, char **argv) {
   RUN_TEST(test_preparePayload_format);
   RUN_TEST(test_preparePayload_uninit_fields);
   RUN_TEST(test_preparePayload_buffer_too_small);
+  RUN_TEST(test_isTimeValid_epoch_zero);
+  RUN_TEST(test_isTimeValid_epoch_15s);
+  RUN_TEST(test_isTimeValid_2024);
+  RUN_TEST(test_isTimeValid_2025);
+  RUN_TEST(test_isTimeValid_2026);
 
   return UNITY_END();
 }
