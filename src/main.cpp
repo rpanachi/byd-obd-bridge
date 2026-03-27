@@ -31,6 +31,7 @@ static const int HTTP_POST_ATTEMPTS       = 5;
 static const int HTTP_POST_DELAY_MS       = 3000;
 static const int NTP_SYNC_ATTEMPTS        = 3;
 static const int NTP_SYNC_TIMEOUT_MS      = 5000;
+static const long GMT_OFFSET_SEC          = -3 * 3600; // BRT (UTC-3)
 static const int ELM_RESPONSE_MAX         = 1024;
 
 // ─── RTC Memory (survives restart, lost on deep sleep) ──────────────────────
@@ -302,7 +303,7 @@ static bool connectWiFi() {
 static bool syncNTP() {
   for (int attempt = 1; attempt <= NTP_SYNC_ATTEMPTS; attempt++) {
     Serial.printf("[NTP] Sync attempt %d/%d...\n", attempt, NTP_SYNC_ATTEMPTS);
-    configTime(0, 0, "pool.ntp.org", "time.google.com");
+    configTime(GMT_OFFSET_SEC, 0, "pool.ntp.org", "time.google.com");
     struct tm timeinfo;
     if (getLocalTime(&timeinfo, NTP_SYNC_TIMEOUT_MS) && isTimeValid(mktime(&timeinfo))) {
       Serial.println("[NTP] Time synced");
