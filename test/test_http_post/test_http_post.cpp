@@ -96,6 +96,22 @@ void test_preparePayload_buffer_too_small(void) {
   TEST_ASSERT_GREATER_THAN(10, written);
 }
 
+void test_preparePayload_brt(void) {
+  VehicleData v;
+  vehicleDataInit(v);
+  strcpy(v.vin, "LGXCE4CB1R0123456");
+  v.soc = 65;
+  v.odometer = 7703.3f;
+  v.batteryV = 29.8f;
+  v.currentA = 2.3f;
+
+  char json[512];
+  time_t t = 1767225600; // 2026-01-01T00:00:00 UTC → 2025-12-31T21:00:00 BRT
+  preparePayload(json, sizeof(json), v, t, -3 * 3600);
+
+  TEST_ASSERT_NOT_NULL(strstr(json, "\"timestamp\":\"2025-12-31T21:00:00-03:00\""));
+}
+
 // ─── isTimeValid ────────────────────────────────────────────────────────────
 
 void test_isTimeValid_epoch_zero(void) {
@@ -132,6 +148,7 @@ int main(int argc, char **argv) {
   RUN_TEST(test_preparePayload_format);
   RUN_TEST(test_preparePayload_uninit_fields);
   RUN_TEST(test_preparePayload_buffer_too_small);
+  RUN_TEST(test_preparePayload_brt);
   RUN_TEST(test_isTimeValid_epoch_zero);
   RUN_TEST(test_isTimeValid_epoch_15s);
   RUN_TEST(test_isTimeValid_2024);

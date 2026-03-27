@@ -5,10 +5,21 @@
 #include <cstring>
 #include "obd_parser.h"
 
-inline int formatISO8601(char* buf, int bufLen, time_t t) {
-  struct tm tmUTC;
-  gmtime_r(&t, &tmUTC);
-  return strftime(buf, bufLen, "%Y-%m-%dT%H:%M:%SZ", &tmUTC);
+inline int formatISO8601(char* buf, int bufLen, time_t t, long gmtOffsetSec = 0) {
+  time_t local = t + gmtOffsetSec;
+  struct tm tmLocal;
+  gmtime_r(&local, &tmLocal);
+
+  int len = strftime(buf, bufLen, "%Y-%m-%dT%H:%M:%S", &tmLocal);
+  if (gmtOffsetSec == 0) {
+    len += snprintf(buf + len, bufLen - len, "Z");
+  } else {
+    int totalMin = (int)(gmtOffsetSec / 60);
+    char sign = totalMin < 0 ? '-' : '+';
+    if (totalMin < 0) totalMin = -totalMin;
+    len += snprintf(buf + len, bufLen - len, "%c%02d:%02d", sign, totalMin / 60, totalMin % 60);
+  }
+  return len;
 }
 
 inline int buildPayloadJSON(char* buf, int bufLen, const VehicleData& v, const char* isoTime) {

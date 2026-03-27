@@ -322,7 +322,7 @@ static bool postVehicleData() {
   time_t now;
   time(&now);
   char json[512];
-  preparePayload(json, sizeof(json), vehicle, now);
+  preparePayload(json, sizeof(json), vehicle, now, GMT_OFFSET_SEC);
 
   HTTPClient http;
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);

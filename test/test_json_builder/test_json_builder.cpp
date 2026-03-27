@@ -51,18 +51,32 @@ void test_buildPayloadJSON_empty_vin(void) {
 
 // ─── formatISO8601 ──────────────────────────────────────────────────────────
 
-void test_formatISO8601(void) {
-  char buf[25];
-  time_t t = 1767225600;
+void test_formatISO8601_utc(void) {
+  char buf[30];
+  time_t t = 1767225600; // 2026-01-01T00:00:00Z
   formatISO8601(buf, sizeof(buf), t);
   TEST_ASSERT_EQUAL_STRING("2026-01-01T00:00:00Z", buf);
 }
 
-void test_formatISO8601_epoch(void) {
-  char buf[25];
+void test_formatISO8601_utc_epoch(void) {
+  char buf[30];
   time_t t = 0;
   formatISO8601(buf, sizeof(buf), t);
   TEST_ASSERT_EQUAL_STRING("1970-01-01T00:00:00Z", buf);
+}
+
+void test_formatISO8601_brt(void) {
+  char buf[30];
+  time_t t = 1767225600; // 2026-01-01T00:00:00 UTC → 2025-12-31T21:00:00 BRT
+  formatISO8601(buf, sizeof(buf), t, -3 * 3600);
+  TEST_ASSERT_EQUAL_STRING("2025-12-31T21:00:00-03:00", buf);
+}
+
+void test_formatISO8601_positive_offset(void) {
+  char buf[30];
+  time_t t = 1767225600; // 2026-01-01T00:00:00 UTC → 2026-01-01T05:30:00 IST
+  formatISO8601(buf, sizeof(buf), t, 5 * 3600 + 1800);
+  TEST_ASSERT_EQUAL_STRING("2026-01-01T05:30:00+05:30", buf);
 }
 
 // ─── Runner ─────────────────────────────────────────────────────────────────
@@ -73,8 +87,10 @@ int main(int argc, char **argv) {
   RUN_TEST(test_buildPayloadJSON_format);
   RUN_TEST(test_buildPayloadJSON_zero_soc);
   RUN_TEST(test_buildPayloadJSON_empty_vin);
-  RUN_TEST(test_formatISO8601);
-  RUN_TEST(test_formatISO8601_epoch);
+  RUN_TEST(test_formatISO8601_utc);
+  RUN_TEST(test_formatISO8601_utc_epoch);
+  RUN_TEST(test_formatISO8601_brt);
+  RUN_TEST(test_formatISO8601_positive_offset);
 
   return UNITY_END();
 }

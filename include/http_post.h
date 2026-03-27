@@ -21,8 +21,8 @@ inline bool isHTTPSuccess(int code) {
 
 // ─── Payload Preparation ────────────────────────────────────────────────────
 
-inline int preparePayload(char* json, int jsonLen, const VehicleData& v, time_t now) {
-  char isoTime[25];
-  formatISO8601(isoTime, sizeof(isoTime), now);
+inline int preparePayload(char* json, int jsonLen, const VehicleData& v, time_t now, long gmtOffsetSec = 0) {
+  char isoTime[30];
+  formatISO8601(isoTime, sizeof(isoTime), now, gmtOffsetSec);
   return buildPayloadJSON(json, jsonLen, v, isoTime);
 }
