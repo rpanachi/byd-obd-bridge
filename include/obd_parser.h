@@ -48,6 +48,13 @@ static const PIDDef PID_TABLE[] = {
 };
 static const int PID_COUNT = sizeof(PID_TABLE) / sizeof(PID_TABLE[0]);
 
+// Indices into PID_TABLE, for code that needs one specific reading.
+enum PIDIndex { PID_SOC = 0, PID_BATTERY_V, PID_CURRENT_A, PID_ODOMETER, PID_CAPACITY };
+
+// UDS ReadDataByIdentifier: the request is "22" + DID and the positive
+// response is "62" + DID, so the DID is whatever follows the service byte.
+inline const char* pidDID(const PIDDef& pid) { return pid.cmd + 2; }
+
 // ─── Hex Parsing ────────────────────────────────────────────────────────────
 
 inline int parseHexByte(const char* p) {
@@ -66,17 +73,26 @@ inline int parseLittleEndian(const char* d, int bytes) {
   return result;
 }
 
-inline const char* findUDSData(const char* resp) {
-  const char* p = strstr(resp, "62");
+// Locate the payload of a UDS positive response (service 0x62) for one DID.
+//
+// The response must contain "62" immediately followed by the requested DID
+// (e.g. "620026" for DID 0026). A reply to a different request — including a
+// late reply to the previous command arriving after a timeout — never matches,
+// so it can't be parsed into the wrong field. The ELM327 prints hex in upper
+// case, so the DID must be given in upper case as well.
+inline const char* findUDSData(const char* resp, const char* did) {
+  if (!resp || !did || strlen(did) != 4) return NULL;
+  const char pattern[7] = {'6', '2', did[0], did[1], did[2], did[3], '\0'};
+  const char* p = strstr(resp, pattern);
   if (!p) return NULL;
   p += 6;
-  return isxdigit(*p) ? p : NULL;
+  return isxdigit((unsigned char)*p) ? p : NULL;
 }
 
 // ─── PID Response Processing ────────────────────────────────────────────────
 
 inline bool applyPIDResponse(VehicleData& v, const PIDDef& pid, const char* response) {
-  const char* d = findUDSData(response);
+  const char* d = findUDSData(response, pidDID(pid));
   if (!d) return false;
   int raw = parseLittleEndian(d, pid.bytes);
   if (raw < 0) return false;

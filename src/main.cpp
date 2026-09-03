@@ -17,6 +17,7 @@
 #include <HTTPClient.h>
 #include "secrets.h"
 #include "obd_parser.h"
+#include "vehicle_validation.h"
 #include "http_post.h"
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -25,6 +26,7 @@ static const int BLE_CONNECT_ATTEMPTS     = 5;
 static const int BLE_CONNECT_DELAY_MS     = 5000;
 static const int OBD_READ_ATTEMPTS        = 5;
 static const int OBD_READ_DELAY_MS        = 10000;
+static const int CONFIRM_READ_DELAY_MS    = 500;
 static const int WIFI_CONNECT_ATTEMPTS    = 3;
 static const int WIFI_CONNECT_TIMEOUT_MS  = 30000;
 static const int HTTP_POST_ATTEMPTS       = 5;
@@ -33,6 +35,7 @@ static const int NTP_SYNC_ATTEMPTS        = 3;
 static const int NTP_SYNC_TIMEOUT_MS      = 5000;
 static const long GMT_OFFSET_SEC          = -3 * 3600; // BRT (UTC-3)
 static const int ELM_RESPONSE_MAX         = 1024;
+static const int ELM_DRAIN_TIMEOUT_MS     = 2000;
 
 // ─── RTC Memory (survives restart, lost on deep sleep) ──────────────────────
 
@@ -86,6 +89,7 @@ static volatile int  elmResponseLen   = 0;
 static volatile bool elmResponseReady = false;
 static bool bleDeviceFound = false;
 static bool bleConnected   = false;
+static bool elmReplyPending = false;  // last command timed out; its reply may still arrive
 
 // ─── Utility ────────────────────────────────────────────────────────────────
 
@@ -143,6 +147,13 @@ class ClientCallbacks : public BLEClientCallbacks {
 // ─── ELM327 Communication ──────────────────────────────────────────────────
 
 static bool elmSend(const char* cmd, uint32_t timeout = 4000) {
+  if (elmReplyPending) {
+    // Let the late reply to the previous command arrive and be discarded here,
+    // so it isn't taken for the reply to this command.
+    uint32_t start = millis();
+    while (!elmResponseReady && (millis() - start) < ELM_DRAIN_TIMEOUT_MS) delay(20);
+    elmReplyPending = false;
+  }
   elmResponseLen = 0;
   elmResponseReady = false;
   memset(elmResponse, 0, sizeof(elmResponse));
@@ -150,6 +161,7 @@ static bool elmSend(const char* cmd, uint32_t timeout = 4000) {
   pTxChar->writeValue((uint8_t*)data.c_str(), data.length());
   uint32_t start = millis();
   while (!elmResponseReady && (millis() - start) < timeout) delay(20);
+  elmReplyPending = !elmResponseReady;
   return elmResponseReady;
 }
 
@@ -222,16 +234,23 @@ static bool bleConnect() {
 
 // ─── READY Mode Detection ───────────────────────────────────────────────────
 
+// Observed on the Dolphin Mini: with the car in ON mode but not yet READY,
+// the BMS already answers SOC and voltage requests while the VCU still reports
+// odometer 0 (and current is 0 because the contactors are open). A non-zero
+// odometer is therefore the reliable READY signal, not a BMS reply.
 static bool isVehicleReady() {
-  elmSetHeader("781");
-  if (!elmSend("220005") || elmHasError()) return false;
-  const char* d = findUDSData(elmResponse);
-  return d != NULL;
+  const PIDDef& pid = PID_TABLE[PID_ODOMETER];
+  elmSetHeader(pid.header);
+  if (!elmSend(pid.cmd) || elmHasError()) return false;
+  VehicleData probe;
+  vehicleDataInit(probe);
+  if (!applyPIDResponse(probe, pid, elmResponse)) return false;
+  return isOdometerValid(probe.odometer);
 }
 
 // ─── OBD Data Reading ───────────────────────────────────────────────────────
 
-static void readPIDs() {
+static void readPIDs(VehicleData& v) {
   const char* currentHeader = NULL;
   for (int i = 0; i < PID_COUNT; i++) {
     const PIDDef& pid = PID_TABLE[i];
@@ -240,29 +259,60 @@ static void readPIDs() {
       currentHeader = pid.header;
     }
     if (elmSend(pid.cmd) && !elmHasError()) {
-      applyPIDResponse(vehicle, pid, elmResponse);
+      applyPIDResponse(v, pid, elmResponse);
     }
     delay(60);
   }
 }
 
-static void readAuxBattery() {
+static void readAuxBattery(VehicleData& v) {
   if (elmSend("ATRV")) {
-    float v = atof(elmResponse);
-    if (v > 0) vehicle.auxBattV = v;
+    float volts = atof(elmResponse);
+    if (volts > 0) v.auxBattV = volts;
   }
 }
 
-static void readVIN() {
+static void readVIN(VehicleData& v) {
   elmSetHeader("7DF");
   if (!elmSend("0902", 5000) || elmHasError()) return;
-  parseVIN(elmResponse, vehicle.vin, sizeof(vehicle.vin));
+  parseVIN(elmResponse, v.vin, sizeof(v.vin));
 }
 
-static void readAllData() {
-  readPIDs();
-  readAuxBattery();
-  if (!vehicle.vin[0]) readVIN();
+static void readAllData(VehicleData& v) {
+  readPIDs(v);
+  readAuxBattery(v);
+  if (!v.vin[0]) readVIN(v);
+}
+
+// One complete acquisition: READY probe, full read, plausibility check, and a
+// second read that must agree with the first. Returns true when `vehicle`
+// holds a reading that is safe to post.
+static bool readVehicleData() {
+  if (!isVehicleReady()) {
+    Serial.println("[2/5] Vehicle not in READY mode (odometer unavailable)");
+    return false;
+  }
+  Serial.println("[2/5] Vehicle is in READY mode, reading data...");
+
+  vehicleDataInit(vehicle);
+  readAllData(vehicle);
+  if (!isVehicleDataValid(vehicle)) {
+    Serial.printf("[2/5] Implausible data: SOC=%d%% Odometer=%.1f km V=%.1f\n",
+                  (int)vehicle.soc, vehicle.odometer, vehicle.batteryV);
+    return false;
+  }
+
+  // A transient value (ECU still syncing, stale ELM reply) won't repeat.
+  VehicleData confirm;
+  vehicleDataInit(confirm);
+  delay(CONFIRM_READ_DELAY_MS);
+  readPIDs(confirm);
+  if (!isVehicleDataValid(confirm) || !vehicleDataAgrees(vehicle, confirm)) {
+    Serial.printf("[2/5] Reads disagree: Odometer=%.1f/%.1f km SOC=%d/%d%%\n",
+                  vehicle.odometer, confirm.odometer, (int)vehicle.soc, (int)confirm.soc);
+    return false;
+  }
+  return true;
 }
 
 // ─── Display ────────────────────────────────────────────────────────────────
@@ -371,25 +421,17 @@ static void phaseBLE() {
   for (int attempt = 1; attempt <= OBD_READ_ATTEMPTS; attempt++) {
     Serial.printf("[2/5] Attempt %d/%d...\n", attempt, OBD_READ_ATTEMPTS);
 
-    if (!isVehicleReady()) {
-      Serial.printf("[2/5] Vehicle not in READY mode, retrying in %ds...\n", OBD_READ_DELAY_MS / 1000);
-      delay(OBD_READ_DELAY_MS);
-      continue;
-    }
-    Serial.println("[2/5] Vehicle is in READY mode, reading data...");
-
-    vehicleDataInit(vehicle);
-    readAllData();
-
-    if (vehicle.soc >= 0 && vehicle.odometer >= 0 && vehicle.batteryV >= 0) {
+    if (readVehicleData()) {
       dataValid = true;
       Serial.printf("[2/5] Read OK — SOC=%d%% Odometer=%.1f km\n",
                     (int)vehicle.soc, vehicle.odometer);
       break;
     }
 
-    Serial.printf("[2/5] Incomplete data, retrying in %ds...\n", OBD_READ_DELAY_MS / 1000);
-    if (attempt < OBD_READ_ATTEMPTS) delay(OBD_READ_DELAY_MS);
+    if (attempt < OBD_READ_ATTEMPTS) {
+      Serial.printf("[2/5] Retrying in %ds...\n", OBD_READ_DELAY_MS / 1000);
+      delay(OBD_READ_DELAY_MS);
+    }
   }
 
   printDashboard();

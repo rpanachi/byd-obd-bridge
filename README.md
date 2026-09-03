@@ -9,20 +9,22 @@ The ESP32 runs a one-shot operation in two phases (BLE and WiFi can't share the 
 1. **Phase 1 — BLE Read**: Connect to iCar adapter, read OBD2 data, save to RTC memory, restart
 2. **Phase 2 — WiFi POST**: Connect to WiFi, POST JSON payload, enter deep sleep
 
-The car must be in **Ready mode** (ignition on, HV system active) for valid readings. If the odometer can't be read (car is off), the ESP32 skips the POST and goes directly to deep sleep.
+The car must be in **Ready mode** (ignition on, HV system active) for valid readings. Before the car is READY the BMS may already answer SOC and voltage requests while the VCU still reports odometer 0, so a non-zero odometer is used as the READY signal. Each reading is then checked for plausibility (SOC 1–100 %, odometer > 0, pack voltage within band), and read a second time; both reads must agree on odometer and SOC. Anything else is retried, and if no valid reading is obtained the ESP32 skips the POST and goes directly to deep sleep.
 
 ### JSON Payload
 
 ```json
-{"vin": "LXXXXXXXXXXXXXXXXX", "timestamp": "2026-03-25T12:30:00Z", "odometer": 7703.3, "battery": 65}
+{"vin": "LXXXXXXXXXXXXXXXXX", "timestamp": "2026-03-25T12:30:00-03:00", "odometer": 7703.3, "battery_soc": 65, "battery_v": 29.9, "current_a": 1.2}
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `vin` | string | 17-character Vehicle Identification Number |
-| `timestamp` | string | ISO 8601 UTC datetime, obtained via NTP after WiFi connects |
+| `timestamp` | string | ISO 8601 datetime in BRT (UTC-3), obtained via NTP after WiFi connects |
 | `odometer` | decimal | Odometer reading in km |
-| `battery` | integer | Battery state of charge (%) |
+| `battery_soc` | integer | Battery state of charge (%) |
+| `battery_v` | decimal | Battery voltage (V) |
+| `current_a` | decimal | Battery current (A), negative while charging |
 
 ## Readings
 
@@ -47,10 +49,14 @@ The car must be in **Ready mode** (ignition on, HV system active) for valid read
 ```
 src/main.cpp              # Application logic (BLE, WiFi, phases)
 include/obd_parser.h      # OBD parsing, PID table, VIN decoder
+include/vehicle_validation.h  # Plausibility limits and read-agreement checks
 include/json_builder.h    # JSON payload and ISO 8601 formatting
+include/http_post.h       # Time validation, HTTP status handling, payload preparation
 include/secrets.h         # WiFi/URL credentials (not committed)
 test/test_obd_parser/     # Tests for OBD parsing logic
+test/test_vehicle_validation/  # Tests for plausibility and agreement checks
 test/test_json_builder/   # Tests for JSON payload building
+test/test_http_post/      # Tests for HTTP POST helpers
 ```
 
 ## Setup
@@ -124,12 +130,12 @@ pio test -e native
 
 | Step | Retries | Timeout | On failure |
 |------|---------|---------|------------|
-| BLE connection | 3 | 15s scan | Deep sleep |
+| BLE connection | 5 | 15s scan, 5s between retries | Deep sleep |
 | OBD read | 5 | 10s between retries | Deep sleep |
 | WiFi connection | 3 | 30s each | Deep sleep |
 | HTTP POST | 5 | 3s between retries | Deep sleep |
 
-If the car is off (odometer not readable), the ESP32 skips WiFi/POST and goes directly to deep sleep.
+An OBD read attempt fails when the car is not READY (odometer 0 or not readable), when a value is outside its plausibility band, or when the confirmation read disagrees with the first. If all attempts fail, the ESP32 skips WiFi/POST and goes directly to deep sleep.
 
 ## BLE Compatibility
 

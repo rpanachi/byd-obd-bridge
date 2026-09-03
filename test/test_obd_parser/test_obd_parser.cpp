@@ -56,7 +56,7 @@ void test_parseLittleEndian_invalid(void) {
 
 void test_findUDSData_valid(void) {
   const char* resp = "620005" "4E";
-  const char* d = findUDSData(resp);
+  const char* d = findUDSData(resp, "0005");
   TEST_ASSERT_NOT_NULL(d);
   TEST_ASSERT_EQUAL('4', d[0]);
   TEST_ASSERT_EQUAL('E', d[1]);
@@ -64,15 +64,42 @@ void test_findUDSData_valid(void) {
 
 void test_findUDSData_with_header_prefix(void) {
   const char* resp = "7891620008" "2A01";
-  const char* d = findUDSData(resp);
+  const char* d = findUDSData(resp, "0008");
   TEST_ASSERT_NOT_NULL(d);
   TEST_ASSERT_EQUAL('2', d[0]);
 }
 
 void test_findUDSData_no_match(void) {
-  TEST_ASSERT_NULL(findUDSData("NO DATA"));
-  TEST_ASSERT_NULL(findUDSData("ERROR"));
-  TEST_ASSERT_NULL(findUDSData(""));
+  TEST_ASSERT_NULL(findUDSData("NO DATA", "0005"));
+  TEST_ASSERT_NULL(findUDSData("ERROR", "0005"));
+  TEST_ASSERT_NULL(findUDSData("", "0005"));
+}
+
+void test_findUDSData_wrong_did(void) {
+  // A well-formed reply, but to another request — must not be accepted
+  TEST_ASSERT_NULL(findUDSData("620005" "4E", "0008"));
+  TEST_ASSERT_NULL(findUDSData("74B06620026" "1AB201", "0104"));
+}
+
+void test_findUDSData_stray_62_before_did(void) {
+  // "62" also occurs before the positive response; only "62" + DID counts
+  const char* d = findUDSData("0062" "78905620008" "2A01", "0008");
+  TEST_ASSERT_NOT_NULL(d);
+  TEST_ASSERT_EQUAL('2', d[0]);
+  TEST_ASSERT_EQUAL('A', d[1]);
+}
+
+void test_findUDSData_truncated_payload(void) {
+  // Positive response with no data bytes after the DID
+  TEST_ASSERT_NULL(findUDSData("620026", "0026"));
+  TEST_ASSERT_NULL(findUDSData("74B06620026", "0026"));
+}
+
+void test_findUDSData_invalid_did(void) {
+  TEST_ASSERT_NULL(findUDSData("620005" "4E", NULL));
+  TEST_ASSERT_NULL(findUDSData("620005" "4E", ""));
+  TEST_ASSERT_NULL(findUDSData("620005" "4E", "05"));
+  TEST_ASSERT_NULL(findUDSData(NULL, "0005"));
 }
 
 // ─── VehicleData init ───────────────────────────────────────────────────────
@@ -111,6 +138,21 @@ void test_pid_table_commands(void) {
   TEST_ASSERT_EQUAL_STRING("220009", PID_TABLE[2].cmd);
   TEST_ASSERT_EQUAL_STRING("220026", PID_TABLE[3].cmd);
   TEST_ASSERT_EQUAL_STRING("220104", PID_TABLE[4].cmd);
+}
+
+void test_pid_index_enum(void) {
+  TEST_ASSERT_EQUAL_STRING("220005", PID_TABLE[PID_SOC].cmd);
+  TEST_ASSERT_EQUAL_STRING("220008", PID_TABLE[PID_BATTERY_V].cmd);
+  TEST_ASSERT_EQUAL_STRING("220009", PID_TABLE[PID_CURRENT_A].cmd);
+  TEST_ASSERT_EQUAL_STRING("220026", PID_TABLE[PID_ODOMETER].cmd);
+  TEST_ASSERT_EQUAL_STRING("220104", PID_TABLE[PID_CAPACITY].cmd);
+  TEST_ASSERT_EQUAL(PID_TARGET(odometer), PID_TABLE[PID_ODOMETER].targetOffset);
+}
+
+void test_pidDID(void) {
+  TEST_ASSERT_EQUAL_STRING("0005", pidDID(PID_TABLE[PID_SOC]));
+  TEST_ASSERT_EQUAL_STRING("0026", pidDID(PID_TABLE[PID_ODOMETER]));
+  TEST_ASSERT_EQUAL_STRING("0104", pidDID(PID_TABLE[PID_CAPACITY]));
 }
 
 // ─── applyPIDResponse ───────────────────────────────────────────────────────
@@ -181,6 +223,29 @@ void test_applyPID_isolates_fields(void) {
   TEST_ASSERT_FLOAT_WITHIN(0.01f, -1.0f, v.batteryV);
 }
 
+void test_applyPID_full_elm_line(void) {
+  // Complete ELM327 lines as received with ATH1/ATS0:
+  // CAN id, PCI byte, "62" + DID, data, padding
+  VehicleData v;
+  vehicleDataInit(v);
+  TEST_ASSERT_TRUE(applyPIDResponse(v, PID_TABLE[PID_SOC],      "789" "04" "620005" "50" "000000"));
+  TEST_ASSERT_TRUE(applyPIDResponse(v, PID_TABLE[PID_ODOMETER], "74B" "06" "620026" "1AB201" "00"));
+  TEST_ASSERT_FLOAT_WITHIN(0.01f, 80.0f, v.soc);
+  TEST_ASSERT_FLOAT_WITHIN(0.01f, 11113.0f, v.odometer);
+}
+
+void test_applyPID_rejects_reply_for_other_pid(void) {
+  // A late reply to the previous command (SOC) arriving while waiting for the
+  // voltage reply must not be parsed as voltage...
+  VehicleData v;
+  vehicleDataInit(v);
+  TEST_ASSERT_FALSE(applyPIDResponse(v, PID_TABLE[PID_BATTERY_V], "789" "04" "620005" "50" "000000"));
+  TEST_ASSERT_FLOAT_WITHIN(0.01f, -1.0f, v.batteryV);
+  // ...and a stale VCU reply must not become the BMS current
+  TEST_ASSERT_FALSE(applyPIDResponse(v, PID_TABLE[PID_CURRENT_A], "74B" "05" "620104" "8813" "0000"));
+  TEST_ASSERT_FLOAT_WITHIN(0.01f, -1.0f, v.currentA);
+}
+
 // ─── parseVIN ───────────────────────────────────────────────────────────────
 
 void test_parseVIN_multiframe(void) {
@@ -229,6 +294,10 @@ int main(int argc, char **argv) {
   RUN_TEST(test_findUDSData_valid);
   RUN_TEST(test_findUDSData_with_header_prefix);
   RUN_TEST(test_findUDSData_no_match);
+  RUN_TEST(test_findUDSData_wrong_did);
+  RUN_TEST(test_findUDSData_stray_62_before_did);
+  RUN_TEST(test_findUDSData_truncated_payload);
+  RUN_TEST(test_findUDSData_invalid_did);
 
   // Vehicle data
   RUN_TEST(test_vehicleDataInit);
@@ -237,6 +306,8 @@ int main(int argc, char **argv) {
   RUN_TEST(test_pid_table_count);
   RUN_TEST(test_pid_table_headers);
   RUN_TEST(test_pid_table_commands);
+  RUN_TEST(test_pid_index_enum);
+  RUN_TEST(test_pidDID);
 
   // PID response processing (end-to-end: raw response → parsed value)
   RUN_TEST(test_applyPID_soc);
@@ -247,6 +318,8 @@ int main(int argc, char **argv) {
   RUN_TEST(test_applyPID_capacity);
   RUN_TEST(test_applyPID_no_data);
   RUN_TEST(test_applyPID_isolates_fields);
+  RUN_TEST(test_applyPID_full_elm_line);
+  RUN_TEST(test_applyPID_rejects_reply_for_other_pid);
 
   // VIN parsing
   RUN_TEST(test_parseVIN_multiframe);
